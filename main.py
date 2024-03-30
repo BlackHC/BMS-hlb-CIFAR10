@@ -114,19 +114,29 @@ if not os.path.exists(hyp['misc']['data_location']):
         ## Batch normalize datasets, now. Wowie. We did it! We should take a break and make some tea now.
         train_dataset_gpu['images'] = batch_normalize_images(train_dataset_gpu['images'])
         eval_dataset_gpu['images']  = batch_normalize_images(eval_dataset_gpu['images'])
+        
+        # Also merge both train and eval into a single "merged" dataset
+        merged_dataset_gpu = {
+            'images': torch.cat((train_dataset_gpu['images'], eval_dataset_gpu['images']), dim=0),
+            'targets': torch.cat((train_dataset_gpu['targets'], eval_dataset_gpu['targets']), dim=0)
+        }
+        # Shuffle the merged dataset
+        permuted_indices = torch.randperm(len(merged_dataset_gpu['images']))
+        merged_dataset_gpu['images'] = merged_dataset_gpu['images'][permuted_indices]
+        merged_dataset_gpu['targets'] = merged_dataset_gpu['targets'][permuted_indices]
 
         data = {
             'train': train_dataset_gpu,
-            'eval': eval_dataset_gpu
+            'eval': eval_dataset_gpu,
+            'merged': merged_dataset_gpu
         }
+        
+        for key in data.keys():
+            ## Convert dataset to FP16 now for the rest of the process....
+            data[key]['images'] = data[key]['images'].half().requires_grad_(False)
 
-        ## Convert dataset to FP16 now for the rest of the process....
-        data['train']['images'] = data['train']['images'].half().requires_grad_(False)
-        data['eval']['images']  = data['eval']['images'].half().requires_grad_(False)
-
-        # Convert this to one-hot to support the usage of cutmix (or whatever strange label tricks/magic you desire!)
-        data['train']['targets'] = F.one_hot(data['train']['targets']).half()
-        data['eval']['targets'] = F.one_hot(data['eval']['targets']).half()
+            # Convert this to one-hot to support the usage of cutmix (or whatever strange label tricks/magic you desire!)
+            data[key]['targets'] = F.one_hot(data[key]['targets']).half()
 
         torch.save(data, hyp['misc']['data_location'])
 
@@ -135,7 +145,35 @@ else:
     ## So as long as you run the above loading process once, and keep the file on the disc it's specified by default in the above
     ## hyp dictionary, then we should be good. :)
     data = torch.load(hyp['misc']['data_location'])
+    
 
+def use_cross_validation(num_splits, train_chunks, index):
+    assert 0<=index < num_splits
+    
+    num_samples = len(data["merged"]["images"])
+    indices = torch.arange(num_samples) 
+    chunks = indices.chunk(num_splits)
+    
+    train_chunk_indices = [(i + index) % num_splits for i in range(train_chunks)]
+    test_chunk_indices = [i for i in range(num_splits) if i not in train_chunk_indices]
+    
+    train_indices = torch.cat([chunks[i] for i in train_chunk_indices])
+    test_indices = torch.cat([chunks[i] for i in test_chunk_indices])
+    
+    # Now create the train and test datasets and update the keys in data
+    data["train"]["images"] = data["merged"]["images"][train_indices]
+    data["train"]["targets"] = data["merged"]["targets"][train_indices]
+    data["eval"]["images"] = data["merged"]["images"][test_indices]
+    data["eval"]["targets"] = data["merged"]["targets"][test_indices]
+   
+cross_validation = False
+num_splits = 5
+train_chunks = 2
+cross_validation_index = 0
+
+if cross_validation:
+    use_cross_validation(num_splits, train_chunks, cross_validation_index) 
+    
 ## As you'll note above and below, one difference is that we don't count loading the raw data to GPU since it's such a variable operation, and can sort of get in the way
 ## of measuring other things. That said, measuring the preprocessing (outside of the padding) is still important to us.
 
@@ -452,6 +490,8 @@ class NetworkEMA(nn.Module):
     def forward(self, inputs):
         with torch.no_grad():
             return self.net_ema(inputs)
+        
+use_augmentations = True
 
 # TODO: Could we jit this in the (more distant) future? :)
 @torch.no_grad()
@@ -465,7 +505,7 @@ def get_batches(data_dict, key, batchsize, epoch_fraction=1., cutmix_size=None):
     ## Here, we prep the dataset by applying all data augmentations in batches ahead of time before each epoch, then we return an iterator below
     ## that iterates in chunks over with a random derangement (i.e. shuffled indices) of the individual examples. So we get perfectly-shuffled
     ## batches (which skip the last batch if it's not a full batch), but everything seems to be (and hopefully is! :D) properly shuffled. :)
-    if key == 'train':
+    if key == 'train' and use_augmentations:
         images = batch_crop(data_dict[key]['images'], crop_size) # TODO: hardcoded image size for now?
         images = batch_flip_lr(images)
         images, targets = batch_cutmix(images, data_dict[key]['targets'], patch_size=cutmix_size)
